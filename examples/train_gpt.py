@@ -16,7 +16,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import time
+import urllib.request
 
 import mlx.core as mx
 
@@ -39,6 +41,54 @@ def make_sample_text(size: int = 100_000) -> str:
     return (base * repeats)[:size]
 
 
+def get_shakespeare_text(size_str: str) -> str:
+    """Download and return the Tiny Shakespeare dataset of the specified size.
+
+    If offline or download fails, falls back to synthetic text.
+    """
+    size_map = {
+        "1k": 1000,
+        "10k": 10000,
+        "100k": 100000,
+    }
+    limit = size_map.get(size_str)
+
+    url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+    cache_dir = os.path.join(os.path.dirname(__file__), "data")
+    cache_path = os.path.join(cache_dir, "tinyshakespeare.txt")
+
+    text = ""
+    try:
+        if os.path.exists(cache_path):
+            with open(cache_path, "r", encoding="utf-8") as f:
+                text = f.read()
+        else:
+            print(f"  Downloading Tiny Shakespeare dataset from {url}...")
+            os.makedirs(cache_dir, exist_ok=True)
+            with urllib.request.urlopen(url, timeout=10) as response:
+                content = response.read().decode("utf-8")
+            with open(cache_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            text = content
+            print(f"  Saved to {cache_path}")
+    except Exception as e:
+        print(f"  Warning: Failed to load/download Tiny Shakespeare ({e}).")
+        print("  Falling back to synthetic text generator.")
+        fallback_size = limit if limit is not None else 100_000
+        return make_sample_text(fallback_size)
+
+    if limit is None:
+        return text
+
+    if len(text) < limit:
+        repeats = (limit // max(1, len(text))) + 1
+        text = (text * repeats)[:limit]
+    else:
+        text = text[:limit]
+
+    return text
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train DBlockGPT")
     parser.add_argument("--epochs", type=int, default=3, help="Training epochs")
@@ -51,6 +101,20 @@ def main():
     parser.add_argument("--num-blocks", type=int, default=2, help="DiffusionBlocks blocks")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="shakespeare",
+        choices=["shakespeare", "synthetic"],
+        help="Dataset to use for training",
+    )
+    parser.add_argument(
+        "--data-size",
+        type=str,
+        default="100k",
+        choices=["1k", "10k", "100k", "full"],
+        help="Dataset size in tokens (characters)",
+    )
     args = parser.parse_args()
 
     print("=" * 60)
@@ -59,7 +123,19 @@ def main():
 
     # 1. Create dataset
     print("\n[1/5] Creating dataset...")
-    text = make_sample_text()
+    if args.dataset == "shakespeare":
+        text = get_shakespeare_text(args.data_size)
+        print(f"  Loaded Tiny Shakespeare ({args.data_size})")
+    else:
+        size_map = {"1k": 1000, "10k": 10000, "100k": 100000}
+        size = size_map.get(args.data_size, 100_000)
+        text = make_sample_text(size)
+        print(f"  Generated Synthetic Text ({args.data_size})")
+
+    if len(text) <= args.seq_len:
+        print(f"  Error: Text length ({len(text)}) must be greater than sequence length ({args.seq_len})")
+        return
+
     dataset, batcher = db.data.create_dataset(
         text, seq_len=args.seq_len, batch_size=args.batch_size,
     )

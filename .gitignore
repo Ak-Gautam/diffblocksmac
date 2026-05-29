@@ -12,3 +12,7 @@ build/
 # Native C extension build artifacts
 *.o
 *.dylib
+
+# Example datasets cache
+examples/data/
+
