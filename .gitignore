@@ -8,3 +8,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# Native C extension build artifacts
+*.o
+*.dylib
