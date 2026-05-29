@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dblocks"
+version = "0.1.0"
+description = "Memory-efficient DiffusionBlocks training for Apple Silicon Macs."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [
+  { name = "Gautam" },
+]
+dependencies = [
+    "mlx>=0.25",
+    "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "psutil",
+]
+data = [
+    "tiktoken",
+    "datasets",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dblocks"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
