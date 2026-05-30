@@ -16,13 +16,18 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import time
 import urllib.request
+from typing import Any
 
 import mlx.core as mx
+import mlx.nn as nn
+import mlx.optimizers as optim
 
 import dblocks as db
+from dblocks.training.optimizer import clip_grad_norm
 
 
 def make_sample_text(size: int = 100_000) -> str:
@@ -89,6 +94,202 @@ def get_shakespeare_text(size_str: str) -> str:
     return text
 
 
+class StandardTrainer:
+    """Standard end-to-end autoregressive trainer for fair comparison."""
+
+    def __init__(
+        self,
+        model: db.DBlockGPT,
+        lr: float = 3e-4,
+        weight_decay: float = 0.1,
+        warmup_steps: int = 100,
+        max_steps: int = 0,
+        seed: int = 42,
+    ):
+        self.model = model
+        self.model.unfreeze()
+
+        self.optimizer = optim.AdamW(
+            learning_rate=lr,
+            weight_decay=weight_decay,
+            betas=(0.9, 0.95),
+        )
+
+        self.base_lr = lr
+        self.warmup_steps = warmup_steps
+        self.max_steps = max_steps
+        self._step_count = 0
+        mx.random.seed(seed)
+
+        # Build the loss + grad function
+        self._loss_and_grad_fn = nn.value_and_grad(
+            model, self._compute_loss
+        )
+
+    def _get_lr(self) -> float:
+        step = self._step_count
+        if self.warmup_steps > 0 and step < self.warmup_steps:
+            return self.base_lr * step / self.warmup_steps
+        if self.max_steps > 0:
+            progress = (step - self.warmup_steps) / max(
+                1, self.max_steps - self.warmup_steps
+            )
+            progress = min(progress, 1.0)
+            return self.base_lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * progress)))
+        return self.base_lr
+
+    def _compute_loss(
+        self,
+        model: db.DBlockGPT,
+        tokens: mx.array,
+    ) -> mx.array:
+        logits = model(tokens)
+        if logits.dtype != mx.float32:
+            logits = logits.astype(mx.float32)
+        shift_logits = logits[:, :-1, :]
+        shift_targets = tokens[:, 1:]
+        loss = mx.mean(nn.losses.cross_entropy(shift_logits.reshape(-1, logits.shape[-1]), shift_targets.reshape(-1)))
+        return loss
+
+    def train_step(self, tokens: mx.array) -> dict[str, Any]:
+        self._step_count += 1
+        lr = self._get_lr()
+        self.optimizer.learning_rate = mx.array(lr)
+
+        self.model.unfreeze()
+
+        loss, grads = self._loss_and_grad_fn(self.model, tokens)
+
+        # Clip gradients
+        grads, grad_norm = clip_grad_norm(grads, 1.0)
+        mx.eval(grad_norm)
+
+        self.optimizer.update(self.model, grads)
+
+        # Force evaluation
+        mx.eval(self.model.parameters())
+        mx.eval(self.optimizer.state)
+        mx.eval(loss)
+
+        return {
+            "loss": float(loss),
+            "lr": lr,
+        }
+
+
+def run_dblocks(model, batcher, args, total_steps, warmup_steps):
+    print(f"\n[4/5] Training with DiffusionBlocks ({args.epochs} epochs × {args.steps} steps)...")
+    print(f"  Warmup steps: {warmup_steps} ({args.warmup_pct * 100:.1f}% of {total_steps} total steps)")
+    trainer = db.DBlockTrainer(
+        model,
+        lr=args.lr,
+        warmup_steps=warmup_steps,
+        max_steps=total_steps,
+        lm_weight=1.0,
+        callbacks=[
+            db.ProgressCallback(log_every=max(1, args.steps // 10)),
+            db.MemoryCallback(log_every=max(1, args.steps // 2)),
+        ],
+        seed=args.seed,
+    )
+
+    try:
+        mx.reset_peak_memory()
+    except Exception:
+        try:
+            mx.metal.reset_peak_memory()
+        except Exception:
+            pass
+
+    start_time = time.time()
+    history = trainer.fit(
+        batcher, epochs=args.epochs, steps_per_epoch=args.steps,
+    )
+    train_time = time.time() - start_time
+
+    peak_mem = 0.0
+    try:
+        peak_mem = mx.metal.get_peak_memory() / (1024 * 1024)
+    except Exception:
+        pass
+
+    return history, train_time, peak_mem
+
+
+def run_standard(model, batcher, args, total_steps, warmup_steps):
+    print(f"\n[4/5] Training with Standard End-to-End ({args.epochs} epochs × {args.steps} steps)...")
+    print(f"  Warmup steps: {warmup_steps} ({args.warmup_pct * 100:.1f}% of {total_steps} total steps)")
+    trainer = StandardTrainer(
+        model,
+        lr=args.lr,
+        warmup_steps=warmup_steps,
+        max_steps=total_steps,
+        seed=args.seed,
+    )
+
+    try:
+        mx.reset_peak_memory()
+    except Exception:
+        try:
+            mx.metal.reset_peak_memory()
+        except Exception:
+            pass
+
+    history = []
+    start_time = time.time()
+    global_step = 0
+
+    for epoch in range(1, args.epochs + 1):
+        epoch_losses = []
+        step_in_epoch = 0
+        epoch_start = time.time()
+
+        for batch in batcher:
+            global_step += 1
+            step_in_epoch += 1
+
+            if batch.dtype != mx.int32 and batch.dtype != mx.uint32:
+                batch = batch.astype(mx.int32)
+
+            res = trainer.train_step(batch)
+            loss = res["loss"]
+            lr = res["lr"]
+            epoch_losses.append(loss)
+
+            metrics = {
+                "step": global_step,
+                "epoch": epoch,
+                "loss": loss,
+                "lr": lr,
+            }
+            history.append(metrics)
+
+            log_every = max(1, args.steps // 10)
+            if global_step == 1 or global_step % log_every == 0:
+                steps_per_sec = global_step / max(0.1, time.time() - start_time)
+                print(
+                    f"step {global_step:6d} | loss={loss:.4f} | lr={lr:.2e} | "
+                    f"t={time.time() - start_time:.1f}s | {steps_per_sec:.1f} steps/s"
+                )
+
+            if step_in_epoch >= args.steps:
+                break
+
+        epoch_avg = sum(epoch_losses) / max(len(epoch_losses), 1)
+        epoch_time = time.time() - epoch_start
+        print(f"--- Epoch {epoch} complete | avg_loss={epoch_avg:.4f} | {epoch_time:.1f}s ---")
+
+    train_time = time.time() - start_time
+
+    peak_mem = 0.0
+    try:
+        peak_mem = mx.metal.get_peak_memory() / (1024 * 1024)
+    except Exception:
+        pass
+
+    return history, train_time, peak_mem
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train DBlockGPT")
     parser.add_argument("--epochs", type=int, default=3, help="Training epochs")
@@ -100,6 +301,19 @@ def main():
     parser.add_argument("--heads", type=int, default=4, help="Attention heads")
     parser.add_argument("--num-blocks", type=int, default=2, help="DiffusionBlocks blocks")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument(
+        "--warmup-pct",
+        type=float,
+        default=0.05,
+        help="Warmup phase percentage of total training steps (e.g. 0.05 for 5%)",
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="dblocks",
+        choices=["dblocks", "standard", "both"],
+        help="Training method to run",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
         "--dataset",
@@ -118,7 +332,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print("DiffusionBlocks GPT Training Example")
+    print("DiffusionBlocks vs Standard GPT Training Comparison")
     print("=" * 60)
 
     # 1. Create dataset
@@ -143,8 +357,8 @@ def main():
     print(f"  Vocab size:  {dataset.vocab_size}")
     print(f"  Seq length:  {args.seq_len}")
 
-    # 2. Build model
-    print("\n[2/5] Building model...")
+    # 2. Build model config
+    print("\n[2/5] Building model config...")
     config = db.GPTConfig(
         vocab_size=dataset.vocab_size,
         dim=args.dim,
@@ -156,77 +370,131 @@ def main():
         use_swiglu=True,
         dtype=mx.float16,
     )
-    model = db.DBlockGPT(config)
 
-    print(f"  Parameters:  {model.num_parameters():,}")
-    mem = model.memory_estimate_mb()
+    # We construct the model just to estimate parameters and memory
+    temp_model = db.DBlockGPT(config)
+    print(f"  Parameters:  {temp_model.num_parameters():,}")
+    mem = temp_model.memory_estimate_mb()
     print(f"  Params:      {mem['params']:.1f} MB")
     print(f"  E2E peak:    {mem['e2e_peak_estimate']:.1f} MB")
     print(f"  DBlock peak: {mem['dblock_peak_estimate']:.1f} MB")
     savings = mem['e2e_peak_estimate'] / max(mem['dblock_peak_estimate'], 0.1)
     print(f"  Savings:     ~{savings:.1f}x memory reduction")
 
-    # Show block specs
-    print(f"\n  Block assignments:")
-    for spec in model.block_specs:
-        print(
-            f"    Block {spec.model_index}: layers {spec.layers}, "
-            f"σ=[{spec.sigma_min:.4f}, {spec.sigma_max:.4f}]"
-        )
-
     # 3. Memory snapshot before training
     print("\n[3/5] Memory baseline...")
     print(f"  {db.memory_summary()}")
 
-    # 4. Train
-    print(f"\n[4/5] Training ({args.epochs} epochs × {args.steps} steps)...")
-    trainer = db.DBlockTrainer(
-        model,
-        lr=args.lr,
-        warmup_steps=min(50, args.steps),
-        max_steps=args.epochs * args.steps,
-        lm_weight=1.0,
-        callbacks=[
-            db.ProgressCallback(log_every=10),
-            db.MemoryCallback(log_every=50),
-        ],
-        seed=args.seed,
-    )
+    total_steps = args.epochs * args.steps
+    warmup_steps = int(args.warmup_pct * total_steps)
 
-    start_time = time.time()
-    history = trainer.fit(
-        batcher, epochs=args.epochs, steps_per_epoch=args.steps,
-    )
-    train_time = time.time() - start_time
+    history_db = None
+    history_std = None
+    time_db = 0.0
+    time_std = 0.0
+    peak_db = 0.0
+    peak_std = 0.0
 
-    # 5. Summary
-    print(f"\n[5/5] Results")
-    print(f"  Total time:  {train_time:.1f}s")
-    print(f"  Total steps: {len(history)}")
-    if history:
-        final_loss = history[-1]["loss"]
-        first_loss = history[0]["loss"]
-        print(f"  First loss:  {first_loss:.4f}")
-        print(f"  Final loss:  {final_loss:.4f}")
-        print(f"  Reduction:   {first_loss - final_loss:.4f}")
+    # 4. Train with chosen method(s)
+    if args.method in ["dblocks", "both"]:
+        # Seed everything and build a fresh model for DiffusionBlocks
+        mx.random.seed(args.seed)
+        model = db.DBlockGPT(config)
+        history_db, time_db, peak_db = run_dblocks(model, batcher, args, total_steps, warmup_steps)
 
-    print(f"\n  {db.memory_summary()}")
+        # 5. Summary
+        print(f"\n[5/5] DiffusionBlocks Results")
+        print(f"  Total time:  {time_db:.1f}s")
+        print(f"  Total steps: {len(history_db)}")
+        if history_db:
+            final_loss = history_db[-1]["loss"]
+            first_loss = history_db[0]["loss"]
+            print(f"  First loss:  {first_loss:.4f}")
+            print(f"  Final loss:  {final_loss:.4f}")
+            print(f"  Reduction:   {first_loss - final_loss:.4f}")
+            print(f"  Peak Memory: {peak_db:.1f} MB")
 
-    # 6. Generate sample text
-    print("\n[Bonus] Generating sample text...")
-    prompt = text[:20]
-    prompt_tokens = mx.array([[dataset.char_to_idx.get(c, 0) for c in prompt]])
+        # 6. Generate sample text
+        print("\n[Bonus] Generating sample text with DiffusionBlocks model...")
+        prompt = text[:20]
+        prompt_tokens = mx.array([[dataset.char_to_idx.get(c, 0) for c in prompt]])
+        model.eval()
+        try:
+            generated = model.generate(
+                prompt_tokens, max_new_tokens=50, temperature=0.8,
+            )
+            output = dataset.decode(generated[0].tolist())
+            print(f"  Prompt: '{prompt}'")
+            print(f"  Output: '{output}'")
+        except Exception as e:
+            print(f"  Generation skipped ({e})")
 
-    model.eval()  # Disable dropout
-    try:
-        generated = model.generate(
-            prompt_tokens, max_new_tokens=50, temperature=0.8,
-        )
-        output = dataset.decode(generated[0].tolist())
-        print(f"  Prompt: '{prompt}'")
-        print(f"  Output: '{output}'")
-    except Exception as e:
-        print(f"  Generation skipped ({e})")
+    if args.method in ["standard", "both"]:
+        # Seed everything and build a fresh model for Standard training
+        mx.random.seed(args.seed)
+        model = db.DBlockGPT(config)
+        history_std, time_std, peak_std = run_standard(model, batcher, args, total_steps, warmup_steps)
+
+        # 5. Summary
+        print(f"\n[5/5] Standard E2E Results")
+        print(f"  Total time:  {time_std:.1f}s")
+        print(f"  Total steps: {len(history_std)}")
+        if history_std:
+            final_loss = history_std[-1]["loss"]
+            first_loss = history_std[0]["loss"]
+            print(f"  First loss:  {first_loss:.4f}")
+            print(f"  Final loss:  {final_loss:.4f}")
+            print(f"  Reduction:   {first_loss - final_loss:.4f}")
+            print(f"  Peak Memory: {peak_std:.1f} MB")
+
+        # 6. Generate sample text
+        print("\n[Bonus] Generating sample text with Standard model...")
+        prompt = text[:20]
+        prompt_tokens = mx.array([[dataset.char_to_idx.get(c, 0) for c in prompt]])
+        model.eval()
+        try:
+            generated = model.generate(
+                prompt_tokens, max_new_tokens=50, temperature=0.8,
+            )
+            output = dataset.decode(generated[0].tolist())
+            print(f"  Prompt: '{prompt}'")
+            print(f"  Output: '{output}'")
+        except Exception as e:
+            print(f"  Generation skipped ({e})")
+
+    # Side-by-side comparison summary and logging
+    if args.method == "both":
+        print("\n" + "=" * 60)
+        print("Comparison Summary")
+        print("=" * 60)
+        print(f"{"Metrics":20} | {"DiffusionBlocks":16} | {"Standard E2E":16}")
+        print(f"{"-"*20}-|-{"-"*16}-|-{"-"*16}")
+        print(f"{"Final Loss":20} | {history_db[-1]['loss']:16.4f} | {history_std[-1]['loss']:16.4f}")
+        print(f"{"Peak Memory (MB)":20} | {peak_db:16.1f} | {peak_std:16.1f}")
+        print(f"{"Training Time (s)":20} | {time_db:16.1f} | {time_std:16.1f}")
+        print(f"{"Steps / Second":20} | {len(history_db)/max(0.1, time_db):16.1f} | {len(history_std)/max(0.1, time_std):16.1f}")
+        print("=" * 60)
+
+        # Save comparative CSV
+        csv_path = os.path.join(os.path.dirname(__file__), "dblocks_vs_standard.csv")
+        try:
+            import csv
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["step", "dblocks_loss", "dblocks_lr", "standard_loss", "standard_lr"])
+                for i in range(total_steps):
+                    db_step = history_db[i] if i < len(history_db) else {"loss": "", "lr": ""}
+                    std_step = history_std[i] if i < len(history_std) else {"loss": "", "lr": ""}
+                    writer.writerow([
+                        i + 1,
+                        db_step["loss"],
+                        db_step["lr"],
+                        std_step["loss"],
+                        std_step["lr"]
+                    ])
+            print(f"\nSaved comparison results to {csv_path}")
+        except Exception as e:
+            print(f"Warning: Failed to save CSV ({e})")
 
     print("\nDone!")
 
