@@ -16,3 +16,7 @@ build/
 # Example datasets cache
 examples/data/
 
+# Comparison metrics CSV
+examples/dblocks_vs_standard.csv
+
+
