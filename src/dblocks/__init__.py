@@ -36,6 +36,7 @@ from .core import (
     partition_layers,
     preconditioning,
     sample_training_sigma,
+    sample_training_sigmas,
 )
 
 # -- Models ----------------------------------------------------------------
@@ -69,6 +70,7 @@ __all__ = [
     "partition_layers",
     "preconditioning",
     "sample_training_sigma",
+    "sample_training_sigmas",
     # Models
     "DBlockGPT",
     "GPTConfig",
