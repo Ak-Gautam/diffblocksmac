@@ -15,20 +15,16 @@ Apple Silicon unified memory:
 
 from __future__ import annotations
 
-import math
-import time
-from typing import Any, Callable, Iterator, Sequence
+from random import Random
+from typing import Any, Iterator
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..core.blocks import BlockSpec
-from ..core.sampling import preconditioning, sample_training_sigma
-from ..core.schedules import LogNormalNoise
-from ..models.gpt import DBlockGPT, GPTConfig
+from ..core.sampling import sample_training_sigmas
+from ..models.gpt import DBlockGPT
 from ..nn.attention import _create_causal_mask
 from .callbacks import Callback, ProgressCallback
-from .loss import ar_denoising_loss
 from .optimizer import BlockOptimizer
 
 
@@ -85,6 +81,7 @@ class DBlockTrainer:
 
         # Random state
         mx.random.seed(seed)
+        self._rng = Random(seed)
 
         # Create block optimizer
         total_steps = max_steps
@@ -112,7 +109,7 @@ class DBlockTrainer:
         model: DBlockGPT,
         tokens: mx.array,
         block_idx: int,
-        sigma: float,
+        sigmas: mx.array,
     ) -> mx.array:
         """Compute combined denoising + LM loss for a single block.
 
@@ -130,22 +127,24 @@ class DBlockTrainer:
         # 1. Get clean embeddings — upcast to float32 for all math
         z_clean = model.embed(tokens).astype(mx.float32)
 
-        # 2. Add noise (in float32 — sigma can be up to 80)
-        noise = mx.random.normal(z_clean.shape, dtype=mx.float32)
-        z_noisy = z_clean + sigma * noise
+        sigmas = sigmas.astype(mx.float32)
+        s = sigmas[:, None, None]
 
-        # 3. EDM preconditioning (Python float — exact)
-        s2 = sigma ** 2
+        # 2. Add noise (in float32; sigma can be up to 80)
+        noise = mx.random.normal(z_clean.shape, dtype=mx.float32)
+        z_noisy = z_clean + s * noise
+
+        # 3. EDM preconditioning, per example
+        s2 = sigmas ** 2
         d2 = sd ** 2
         denom = (s2 + d2) ** 0.5
-        c_in = 1.0 / denom
-        c_skip = d2 / (s2 + d2)
-        c_out = sigma * sd / denom
-        c_noise = 0.25 * math.log(sigma)
+        c_in = (1.0 / denom)[:, None, None]
+        c_skip = (d2 / (s2 + d2))[:, None, None]
+        c_out = (sigmas * sd / denom)[:, None, None]
+        c_noise = 0.25 * mx.log(sigmas)
 
         # 4. Conditioning (float32 input)
-        c_noise_arr = mx.full((B,), c_noise, dtype=mx.float32)
-        cond = model.t_embed(c_noise_arr)
+        cond = model.t_embed(c_noise)
         if cond.dtype != mx.float32:
             cond = cond.astype(mx.float32)
 
@@ -160,9 +159,10 @@ class DBlockTrainer:
         # 7. Preconditioned output
         z_out = c_skip * z_noisy + c_out * z_pred
 
-        # 8. Denoising loss (EDM weighted, clamped for stability)
-        weight = min((s2 + d2) / (s2 * d2), 1e4)
-        denoise_loss = weight * mx.mean((z_out - z_clean) ** 2)
+        # 8. Denoising loss (EDM weighted)
+        weight = (s2 + d2) / (s2 * d2)
+        per_example_mse = mx.mean((z_out - z_clean).reshape(B, -1) ** 2, axis=1)
+        denoise_loss = mx.mean(weight * per_example_mse)
 
         # 9. LM loss from preconditioned output
         logits = model.lm_head(model.ln_f(z_out))
@@ -188,17 +188,21 @@ class DBlockTrainer:
             Step metrics including loss, block_idx, sigma, lr.
         """
         # 1. Sample block and sigma
-        block, sigma = sample_training_sigma(
-            self.model.block_specs, noise=self._noise,
+        block, sigma_values = sample_training_sigmas(
+            self.model.block_specs,
+            tokens.shape[0],
+            noise=self._noise,
+            rng=self._rng,
         )
         block_idx = block.model_index
+        sigmas = mx.array(sigma_values, dtype=mx.float32)
 
         # 2. Freeze all except active block + shared
         self.model.freeze_for_block(block_idx)
 
         # 3. Compute loss and gradients
         loss, grads = self._loss_and_grad_fn(
-            self.model, tokens, block_idx, sigma,
+            self.model, tokens, block_idx, sigmas,
         )
 
         # 4. Optimizer step
@@ -210,7 +214,9 @@ class DBlockTrainer:
         return {
             "loss": float(loss),
             "block_idx": block_idx,
-            "sigma": sigma,
+            "sigma": float(mx.mean(sigmas)),
+            "sigma_min": min(sigma_values),
+            "sigma_max": max(sigma_values),
             "lr": lr,
             "metrics": {},
         }

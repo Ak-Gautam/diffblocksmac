@@ -44,19 +44,22 @@ def denoising_loss(
     mx.array
         Scalar loss.
     """
-    if isinstance(sigma, (int, float)):
+    is_scalar_sigma = isinstance(sigma, (int, float))
+    if is_scalar_sigma:
         s2 = sigma ** 2
+        s2_broadcast = s2
     else:
-        s2 = sigma ** 2
+        s2 = sigma.astype(mx.float32) ** 2
+        s2_broadcast = s2
         # Reshape for broadcasting: (B,) -> (B, 1, 1)
-        while s2.ndim < z_pred.ndim:
-            s2 = mx.expand_dims(s2, axis=-1)
+        while s2_broadcast.ndim < z_pred.ndim:
+            s2_broadcast = mx.expand_dims(s2_broadcast, axis=-1)
 
     d2 = sigma_data ** 2
 
     # Preconditioning
-    c_skip = d2 / (s2 + d2)
-    c_out = (s2 ** 0.5) * sigma_data / (s2 + d2) ** 0.5  # σ·σ_d / √(σ²+σ_d²)
+    c_skip = d2 / (s2_broadcast + d2)
+    c_out = (s2_broadcast ** 0.5) * sigma_data / (s2_broadcast + d2) ** 0.5
 
     # Preconditioned output
     z_out = c_skip * z_noisy + c_out * z_pred
@@ -64,10 +67,14 @@ def denoising_loss(
     # EDM loss weight: (σ² + σ_d²) / (σ·σ_d)²
     weight = (s2 + d2) / (s2 * d2)
 
-    # Weighted MSE
+    # Weighted MSE. For per-example sigmas, reduce over non-batch axes first
+    # so each sample receives its own EDM weight.
     diff = z_out - z_clean
-    loss = weight * mx.mean(diff ** 2)
-    return loss
+    if is_scalar_sigma:
+        return weight * mx.mean(diff ** 2)
+
+    per_example_mse = mx.mean(diff.reshape(diff.shape[0], -1) ** 2, axis=1)
+    return mx.mean(weight * per_example_mse)
 
 
 def ar_denoising_loss(

@@ -38,6 +38,11 @@ def _tree_reduce(fn, tree, init=0.0):
     return init
 
 
+def _shared_grads(grads: dict) -> dict:
+    """Return gradients for shared modules only."""
+    return {k: v for k, v in grads.items() if k != "blocks"}
+
+
 def clip_grad_norm(grads, max_norm: float = 1.0):
     """Clip gradient tree by global norm.
 
@@ -166,12 +171,19 @@ class BlockOptimizer:
             grads, grad_norm = clip_grad_norm(grads, self.max_grad_norm)
             mx.eval(grad_norm)
 
-        # Apply gradients
-        self.block_optimizers[block_idx].update(model, grads)
+        # Apply gradients with separate optimizer state for the active block
+        # and the shared modules. This avoids creating a copy of shared Adam
+        # state inside every block optimizer.
+        block_grads = grads.get("blocks", [])[block_idx]
+        self.block_optimizers[block_idx].update(model.blocks[block_idx], block_grads)
+
+        shared = _shared_grads(grads)
+        if shared:
+            self.shared_optimizer.update(model, shared)
 
         # Evaluate to materialize updates and free computation graph
         mx.eval(model.parameters())
-        for opt in [self.block_optimizers[block_idx]]:
+        for opt in [self.block_optimizers[block_idx], self.shared_optimizer]:
             mx.eval(opt.state)
 
         return lr

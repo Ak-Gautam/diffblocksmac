@@ -81,3 +81,35 @@ def sample_training_sigma(
     cdf_hi = noise.cdf(block.train_sigma_max)
     p = rng.uniform(cdf_lo, cdf_hi)
     return block, noise.ppf(p)
+
+
+def sample_training_sigmas(
+    blocks: tuple[BlockSpec, ...] | list[BlockSpec],
+    n_samples: int,
+    *,
+    noise: LogNormalNoise | None = None,
+    rng: Random | None = None,
+) -> tuple[BlockSpec, tuple[float, ...]]:
+    """Uniformly sample one block, then one sigma per batch example.
+
+    The official implementation samples a single block per step but draws a
+    vector of sigmas from that block's truncated log-normal range.  This keeps
+    the active block fixed while reducing the variance from using one scalar
+    noise level for the whole batch.
+    """
+    if n_samples <= 0:
+        raise ValueError("n_samples must be positive")
+    if not blocks:
+        raise ValueError("blocks must not be empty")
+
+    noise = noise or LogNormalNoise()
+    rng = rng or Random()
+
+    block = blocks[rng.randrange(len(blocks))]
+    cdf_lo = noise.cdf(block.train_sigma_min)
+    cdf_hi = noise.cdf(block.train_sigma_max)
+    sigmas = tuple(
+        noise.ppf(rng.uniform(cdf_lo, cdf_hi))
+        for _ in range(n_samples)
+    )
+    return block, sigmas

@@ -10,6 +10,7 @@ from .sampling import (
     edm_weight,
     preconditioning,
     sample_training_sigma,
+    sample_training_sigmas,
 )
 from .schedules import (
     LogNormalNoise,
@@ -30,4 +31,5 @@ __all__ = [
     "partition_layers",
     "preconditioning",
     "sample_training_sigma",
+    "sample_training_sigmas",
 ]
